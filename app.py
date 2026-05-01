@@ -1,34 +1,35 @@
 import os
+import json
 import time
 import random
-import sqlite3
 import threading
 import requests
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 
 # --- Configuration ---
 API_BASE_URL = "https://shy-snow-cd49.amitkr545545.workers.dev/?url="
-DB_FILE = "data.db"
+DB_FILE = "data.json"
 TARGET_RPM = 50  # Requests per minute
 SECONDS_PER_REQUEST = 60.0 / TARGET_RPM
 
 app = Flask(__name__)
 
-# --- Database Setup ---
+# Thread lock to prevent file corruption when reading/writing at the same time
+db_lock = threading.Lock()
+
+# --- JSON Database Setup & Helpers ---
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        # Table for Terabox links
-        c.execute('''CREATE TABLE IF NOT EXISTS links (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                        url TEXT UNIQUE)''')
-        # Table for stats tracking
-        c.execute('''CREATE TABLE IF NOT EXISTS stats (
-                        id INTEGER PRIMARY KEY CHECK (id = 1), 
-                        total INTEGER DEFAULT 0, 
-                        success INTEGER DEFAULT 0)''')
-        c.execute('INSERT OR IGNORE INTO stats (id, total, success) VALUES (1, 0, 0)')
-        conn.commit()
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, 'w') as f:
+            json.dump({"stats": {"total": 0, "success": 0}, "links": []}, f)
+
+def read_db():
+    with open(DB_FILE, 'r') as f:
+        return json.load(f)
+
+def write_db(data):
+    with open(DB_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
 # --- Background Worker ---
 def background_requester():
@@ -36,10 +37,10 @@ def background_requester():
         start_time = time.time()
         
         try:
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("SELECT url FROM links")
-                links = [row[0] for row in c.fetchall()]
+            # Safely read links from JSON
+            with db_lock:
+                data = read_db()
+                links = data.get("links", [])
                 
             if not links:
                 # If no links added yet, sleep and wait
@@ -47,14 +48,14 @@ def background_requester():
                 continue
 
             # Pick a random Terabox link
-            target_link = random.choice(links)
-            request_url = f"{API_BASE_URL}{target_link}"
+            target = random.choice(links)
+            request_url = f"{API_BASE_URL}{target['url']}"
 
-            # Increment Total Count
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("UPDATE stats SET total = total + 1 WHERE id = 1")
-                conn.commit()
+            # Increment Total Count safely
+            with db_lock:
+                data = read_db()
+                data["stats"]["total"] += 1
+                write_db(data)
 
             # Make the API Request
             success = False
@@ -67,10 +68,10 @@ def background_requester():
 
             # Increment Success Count if request succeeded
             if success:
-                with sqlite3.connect(DB_FILE) as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE stats SET success = success + 1 WHERE id = 1")
-                    conn.commit()
+                with db_lock:
+                    data = read_db()
+                    data["stats"]["success"] += 1
+                    write_db(data)
 
         except Exception as e:
             print(f"Worker error: {e}")
@@ -110,13 +111,13 @@ HTML_TEMPLATE = """
             <div class="col-md-6 mb-2">
                 <div class="stat-card bg-total shadow">
                     <h5>Total Requests Sent</h5>
-                    <h2 id="total-count">{{ stats[0] }}</h2>
+                    <h2 id="total-count">{{ stats.total }}</h2>
                 </div>
             </div>
             <div class="col-md-6 mb-2">
                 <div class="stat-card bg-success-stat shadow">
                     <h5>Successful Requests (200 OK)</h5>
-                    <h2 id="success-count">{{ stats[1] }}</h2>
+                    <h2 id="success-count">{{ stats.success }}</h2>
                 </div>
             </div>
         </div>
@@ -146,10 +147,10 @@ HTML_TEMPLATE = """
                     <tbody>
                         {% for link in links %}
                         <tr>
-                            <td>{{ link[0] }}</td>
-                            <td class="text-break">{{ link[1] }}</td>
+                            <td>{{ link.id }}</td>
+                            <td class="text-break">{{ link.url }}</td>
                             <td class="text-end">
-                                <form action="/delete/{{ link[0] }}" method="POST" style="display:inline;">
+                                <form action="/delete/{{ link.id }}" method="POST" style="display:inline;">
                                     <button type="submit" class="btn btn-sm btn-danger">Delete</button>
                                 </form>
                             </td>
@@ -183,42 +184,45 @@ HTML_TEMPLATE = """
 # --- Web Routes ---
 @app.route('/')
 def index():
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("SELECT total, success FROM stats WHERE id = 1")
-        stats = c.fetchone()
-        c.execute("SELECT id, url FROM links ORDER BY id DESC")
-        links = c.fetchall()
-    return render_template_string(HTML_TEMPLATE, stats=stats, links=links)
+    with db_lock:
+        data = read_db()
+    
+    # Reverse links so newest show at the top
+    links_reversed = list(reversed(data["links"]))
+    return render_template_string(HTML_TEMPLATE, stats=data["stats"], links=links_reversed)
 
 @app.route('/add', methods=['POST'])
 def add_link():
     url = request.form.get('url')
     if url:
-        try:
-            with sqlite3.connect(DB_FILE) as conn:
-                c = conn.cursor()
-                c.execute("INSERT INTO links (url) VALUES (?)", (url.strip(),))
-                conn.commit()
-        except sqlite3.IntegrityError:
-            pass # Ignore duplicate links
+        url = url.strip()
+        with db_lock:
+            data = read_db()
+            
+            # Check if URL already exists to avoid duplicates
+            if not any(link['url'] == url for link in data["links"]):
+                # Generate a simple auto-incrementing ID
+                new_id = 1 if not data["links"] else max(link["id"] for link in data["links"]) + 1
+                data["links"].append({"id": new_id, "url": url})
+                write_db(data)
+                
     return redirect(url_for('index'))
 
 @app.route('/delete/<int:link_id>', methods=['POST'])
 def delete_link(link_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM links WHERE id = ?", (link_id,))
-        conn.commit()
+    with db_lock:
+        data = read_db()
+        # Filter out the deleted link
+        data["links"] = [link for link in data["links"] if link["id"] != link_id]
+        write_db(data)
+        
     return redirect(url_for('index'))
 
 @app.route('/api/stats')
 def api_stats():
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("SELECT total, success FROM stats WHERE id = 1")
-        stats = c.fetchone()
-    return jsonify({"total": stats[0], "success": stats[1]})
+    with db_lock:
+        data = read_db()
+    return jsonify({"total": data["stats"]["total"], "success": data["stats"]["success"]})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
