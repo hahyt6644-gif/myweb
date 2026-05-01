@@ -3,19 +3,23 @@ import json
 import time
 import random
 import threading
+import concurrent.futures
 import requests
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 
 # --- Configuration ---
 API_BASE_URL = "https://shy-snow-cd49.amitkr545545.workers.dev/?url="
 DB_FILE = "data.json"
-TARGET_RPM = 50  # Requests per minute
-SECONDS_PER_REQUEST = 60.0 / TARGET_RPM
+CONCURRENT_THREADS = 20  # Number of parallel requests happening at the exact same time
 
 app = Flask(__name__)
 
-# Thread lock to prevent file corruption when reading/writing at the same time
+# Locks for thread safety
 db_lock = threading.Lock()
+ram_lock = threading.Lock()
+
+# In-memory stats for high-speed counting (prevents disk bottleneck)
+ram_stats = {"total": 0, "success": 0}
 
 # --- JSON Database Setup & Helpers ---
 def init_db():
@@ -31,61 +35,79 @@ def write_db(data):
     with open(DB_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-# --- Background Worker ---
-def background_requester():
-    while True:
-        start_time = time.time()
-        
-        try:
-            # Safely read links from JSON
+# --- Parallel API Requester ---
+def make_api_call(target_url):
+    global ram_stats
+    request_url = f"{API_BASE_URL}{target_url}"
+    
+    # Increment total in RAM
+    with ram_lock:
+        ram_stats["total"] += 1
+
+    success = False
+    try:
+        # 5-second timeout keeps threads from hanging so they can move to the next request instantly
+        response = requests.get(request_url, timeout=5)
+        if response.status_code == 200:
+            success = True
+    except requests.RequestException:
+        pass
+
+    # Increment success in RAM
+    if success:
+        with ram_lock:
+            ram_stats["success"] += 1
+
+def parallel_worker():
+    """Maintains a continuous pool of active threads bombarding the API."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_THREADS) as executor:
+        while True:
+            # 1. Fetch active links from DB
             with db_lock:
                 data = read_db()
-                links = data.get("links", [])
-                
+                links = [link['url'] for link in data.get("links", [])]
+            
             if not links:
-                # If no links added yet, sleep and wait
                 time.sleep(2)
                 continue
 
-            # Pick a random Terabox link
-            target = random.choice(links)
-            request_url = f"{API_BASE_URL}{target['url']}"
+            # 2. Fire off a batch of parallel requests
+            futures = []
+            for _ in range(CONCURRENT_THREADS):
+                target = random.choice(links)
+                futures.append(executor.submit(make_api_call, target))
+            
+            # 3. Wait for the batch to finish, then immediately loop again (No Sleep)
+            concurrent.futures.wait(futures)
 
-            # Increment Total Count safely
-            with db_lock:
-                data = read_db()
-                data["stats"]["total"] += 1
-                write_db(data)
+def disk_sync_worker():
+    """Saves RAM stats to the JSON file every 3 seconds to prevent data loss."""
+    global ram_stats
+    while True:
+        time.sleep(3)
+        with ram_lock:
+            if ram_stats["total"] == 0 and ram_stats["success"] == 0:
+                continue
+            
+            # Copy and instantly reset RAM stats
+            to_add_total = ram_stats["total"]
+            to_add_success = ram_stats["success"]
+            ram_stats["total"] = 0
+            ram_stats["success"] = 0
+        
+        # Save to disk safely
+        with db_lock:
+            data = read_db()
+            data["stats"]["total"] += to_add_total
+            data["stats"]["success"] += to_add_success
+            write_db(data)
 
-            # Make the API Request
-            success = False
-            try:
-                response = requests.get(request_url, timeout=10)
-                if response.status_code == 200:
-                    success = True
-            except requests.RequestException:
-                pass
-
-            # Increment Success Count if request succeeded
-            if success:
-                with db_lock:
-                    data = read_db()
-                    data["stats"]["success"] += 1
-                    write_db(data)
-
-        except Exception as e:
-            print(f"Worker error: {e}")
-
-        # Calculate time taken and sleep exactly enough to maintain 50 requests/min
-        elapsed = time.time() - start_time
-        sleep_time = max(0, SECONDS_PER_REQUEST - elapsed)
-        time.sleep(sleep_time)
-
-# Start background worker only once
+# Start workers only once
 init_db()
-if not hasattr(app, 'worker_started'):
-    app.worker_started = True
-    threading.Thread(target=background_requester, daemon=True).start()
+if not hasattr(app, 'workers_started'):
+    app.workers_started = True
+    threading.Thread(target=parallel_worker, daemon=True).start()
+    threading.Thread(target=disk_sync_worker, daemon=True).start()
 
 # --- HTML Web Panel Template ---
 HTML_TEMPLATE = """
@@ -101,23 +123,29 @@ HTML_TEMPLATE = """
         .stat-card { border-radius: 10px; padding: 20px; color: white; }
         .bg-total { background: linear-gradient(45deg, #0d6efd, #0dcaf0); }
         .bg-success-stat { background: linear-gradient(45deg, #198754, #20c997); }
+        .pulse { animation: pulse-animation 2s infinite; }
+        @keyframes pulse-animation {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+            100% { transform: scale(1); }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h2 class="mb-4">⚡ API Traffic Controller</h2>
+        <h2 class="mb-4">🚀 High-Speed API Controller <span class="badge bg-danger fs-6 pulse">Parallel Mode Active</span></h2>
         
         <div class="row mb-4">
             <div class="col-md-6 mb-2">
                 <div class="stat-card bg-total shadow">
                     <h5>Total Requests Sent</h5>
-                    <h2 id="total-count">{{ stats.total }}</h2>
+                    <h2 id="total-count">Loading...</h2>
                 </div>
             </div>
             <div class="col-md-6 mb-2">
                 <div class="stat-card bg-success-stat shadow">
                     <h5>Successful Requests (200 OK)</h5>
-                    <h2 id="success-count">{{ stats.success }}</h2>
+                    <h2 id="success-count">Loading...</h2>
                 </div>
             </div>
         </div>
@@ -175,7 +203,7 @@ HTML_TEMPLATE = """
                     document.getElementById('success-count').innerText = data.success;
                 })
                 .catch(err => console.error(err));
-        }, 2000);
+        }, 1000);
     </script>
 </body>
 </html>
@@ -189,7 +217,7 @@ def index():
     
     # Reverse links so newest show at the top
     links_reversed = list(reversed(data["links"]))
-    return render_template_string(HTML_TEMPLATE, stats=data["stats"], links=links_reversed)
+    return render_template_string(HTML_TEMPLATE, links=links_reversed)
 
 @app.route('/add', methods=['POST'])
 def add_link():
@@ -199,9 +227,8 @@ def add_link():
         with db_lock:
             data = read_db()
             
-            # Check if URL already exists to avoid duplicates
+            # Check if URL already exists
             if not any(link['url'] == url for link in data["links"]):
-                # Generate a simple auto-incrementing ID
                 new_id = 1 if not data["links"] else max(link["id"] for link in data["links"]) + 1
                 data["links"].append({"id": new_id, "url": url})
                 write_db(data)
@@ -212,7 +239,6 @@ def add_link():
 def delete_link(link_id):
     with db_lock:
         data = read_db()
-        # Filter out the deleted link
         data["links"] = [link for link in data["links"] if link["id"] != link_id]
         write_db(data)
         
@@ -220,9 +246,14 @@ def delete_link(link_id):
 
 @app.route('/api/stats')
 def api_stats():
+    # Combine Database (permanent) stats with RAM (temporary fast) stats for real-time display
     with db_lock:
         data = read_db()
-    return jsonify({"total": data["stats"]["total"], "success": data["stats"]["success"]})
+    with ram_lock:
+        current_total = data["stats"]["total"] + ram_stats["total"]
+        current_success = data["stats"]["success"] + ram_stats["success"]
+        
+    return jsonify({"total": current_total, "success": current_success})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
