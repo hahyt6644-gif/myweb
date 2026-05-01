@@ -8,7 +8,7 @@ import requests
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 
 # --- Configuration ---
-API_BASE_URL = "https://shy-snow-cd49.amitkr545545.workers.dev/?url="
+API_BASE_URL = ""
 DB_FILE = "data.json"
 CONCURRENT_THREADS = 20  # Number of parallel requests happening at the exact same time
 
